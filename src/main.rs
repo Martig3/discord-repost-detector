@@ -15,6 +15,7 @@ use serenity::utils::MessageBuilder;
 
 struct Handler;
 
+#[derive(PartialEq, Eq, Hash)]
 struct ImageMetadata {
     hash: ImageHash,
     timestamp: DateTime<Utc>,
@@ -22,6 +23,7 @@ struct ImageMetadata {
     msg_link: String,
 }
 
+#[derive(PartialEq, Eq, Hash)]
 struct LinkMetadata {
     url: String,
     timestamp: DateTime<Utc>,
@@ -33,20 +35,32 @@ struct HashCache;
 
 struct LinkCache;
 
+struct AllowedLinks;
+
+struct AllowedHashes;
+
 struct Config {
     cache_limit: u64,
 }
 
 impl TypeMapKey for HashCache {
-    type Value = Vec<ImageMetadata>;
+    type Value = HashSet<ImageMetadata>;
 }
 
 impl TypeMapKey for LinkCache {
-    type Value = Vec<LinkMetadata>;
+    type Value = HashSet<LinkMetadata>;
 }
 
 impl TypeMapKey for Config {
     type Value = Config;
+}
+
+impl TypeMapKey for AllowedLinks {
+    type Value = HashSet<String>;
+}
+
+impl TypeMapKey for AllowedHashes {
+    type Value = HashSet<ImageHash>;
 }
 
 #[tokio::main]
@@ -61,9 +75,12 @@ async fn main() {
         .expect("Error creating client");
     {
         let mut data = client.data.write().await;
-        data.insert::<HashCache>(Vec::new());
-        data.insert::<LinkCache>(Vec::new());
-        data.insert::<Config>(read_config());
+        let config = read_config();
+        data.insert::<Config>(config);
+        data.insert::<HashCache>(HashSet::with_capacity(read_config().cache_limit as usize));
+        data.insert::<LinkCache>(HashSet::with_capacity(read_config().cache_limit as usize));
+        data.insert::<AllowedHashes>(HashSet::with_capacity(read_config().cache_limit as usize));
+        data.insert::<AllowedLinks>(HashSet::with_capacity(read_config().cache_limit as usize));
     }
     // start listening for events by starting a single shard
     if let Err(why) = client.start().await {
@@ -82,20 +99,29 @@ impl EventHandler for Handler {
     async fn message(&self, context: Context, msg: Message) {
         if msg.author.bot { return; }
         let url_regex = Regex::new("https?://(www\\.)?[-a-zA-Z0-9@:%._+~#=]{2,256}\\.[a-z]{2,4}\\b([-a-zA-Z0-9@:%_+.~#?&/=]*)").unwrap();
-        let attachments: Vec<&Attachment> = msg.attachments.iter().map(|a| a).collect();
+        if msg.content.contains("--allow") {
+            set_allowed(&context, &msg, &url_regex).await;
+            return;
+        }
+        let mut data = context.data.write().await;
+        let allowed_links: HashSet<String> = data.get::<AllowedLinks>().unwrap().clone();
+        let attachments: Vec<&Attachment> = msg.attachments.iter()
+            .map(|a| a)
+            .collect();
         let embedded: Vec<String> = msg.embeds.iter()
             .map(|e| e.url.clone())
             .filter(|e| e.is_some())
-            .map(|e| e.unwrap().clone())
+            .map(|e| e.unwrap())
+            .filter(|str| !allowed_links.contains(str))
             .collect();
         if attachments.is_empty() && embedded.is_empty() && !url_regex.is_match(&msg.content) {
             return;
         }
-        let mut data = context.data.write().await;
-        let config: &Config = data.get::<Config>().unwrap().clone();
-        let cache_size = config.cache_limit.clone();
-        let link_cache: &mut Vec<LinkMetadata> = &mut data.get_mut::<LinkCache>().unwrap();
-        let url_matches: HashSet<&str> = url_regex.find_iter(&msg.content).map(|mat| mat.as_str()).collect();
+        let link_cache: &mut HashSet<LinkMetadata> = &mut data.get_mut::<LinkCache>().unwrap();
+        let url_matches: HashSet<&str> = url_regex.find_iter(&msg.content)
+            .map(|mat| mat.as_str())
+            .filter(|str| !allowed_links.contains(&*str.to_string()))
+            .collect();
         for url in url_matches {
             let link = link_cache.iter().find(|l| l.url == url);
             if link.is_some() {
@@ -121,32 +147,27 @@ impl EventHandler for Handler {
                 let user = msg.author.clone();
                 let msg_link = msg.link().clone();
                 let timestamp = msg.timestamp;
-                println!("{}", url);
-                link_cache.push(LinkMetadata { url, timestamp, user, msg_link });
-                if link_cache.len() > cache_size as usize {
-                    link_cache.pop();
-                }
+                link_cache.insert(LinkMetadata { url, timestamp, user, msg_link });
             }
         }
         let mut hashes: Vec<ImageHash> = Vec::new();
+        let allowed_hashes: HashSet<ImageHash> = data.get::<AllowedHashes>().unwrap().clone();
         for url in embedded {
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(img_bytes) = resp.bytes().await {
-                    if let Ok(img) = &image::load_from_memory(img_bytes.as_ref()) {
-                        let image_hash = HasherConfig::new().to_hasher().hash_image(img);
-                        hashes.push(image_hash);
-                    }
+            if let Some(image_hash) = get_embedded_hash(url).await {
+                if !allowed_hashes.contains(&image_hash) {
+                    hashes.push(image_hash);
                 }
             }
         }
         for attachment in attachments {
-            if let Ok(img) = attachment.download().await {
-                let image_hash = HasherConfig::new().to_hasher().hash_image(&image::load_from_memory(img.as_ref()).unwrap());
-                hashes.push(image_hash);
+            if let Some(image_hash) = get_attachment_hash(attachment.clone()).await {
+                if !allowed_hashes.contains(&image_hash) {
+                    hashes.push(image_hash);
+                }
             }
         }
         let mut result: Option<&ImageMetadata>;
-        let metadata_cache: &mut Vec<ImageMetadata> = &mut data.get_mut::<HashCache>().unwrap();
+        let metadata_cache: &mut HashSet<ImageMetadata> = &mut data.get_mut::<HashCache>().unwrap();
         for hash in hashes {
             result = metadata_cache.iter()
                 .find(|i| hash.dist(&i.hash) < 2);
@@ -154,10 +175,7 @@ impl EventHandler for Handler {
                 let user = msg.author.clone();
                 let msg_link = msg.link().clone();
                 let timestamp = msg.timestamp;
-                metadata_cache.push(ImageMetadata { hash, timestamp, user, msg_link });
-                if metadata_cache.len() > cache_size as usize {
-                    metadata_cache.pop();
-                }
+                metadata_cache.insert(ImageMetadata { hash, timestamp, user, msg_link });
             } else {
                 let utc_now: DateTime<Utc> = Utc::now();
                 let days_between = utc_now.signed_duration_since(result.unwrap().timestamp).num_days();
@@ -177,6 +195,58 @@ impl EventHandler for Handler {
                     println!("{}", e);
                 }
             }
+        }
+    }
+}
+
+async fn get_embedded_hash(url: String) -> Option<ImageHash> {
+    if let Ok(resp) = reqwest::get(&url).await {
+        if let Ok(img_bytes) = resp.bytes().await {
+            if let Ok(img) = &image::load_from_memory(img_bytes.as_ref()) {
+                let image_hash = HasherConfig::new()
+                    .to_hasher()
+                    .hash_image(img);
+                return Some(image_hash);
+            }
+        }
+    }
+    None
+}
+
+async fn get_attachment_hash(attachment: Attachment) -> Option<ImageHash> {
+    if let Ok(img) = attachment.download().await {
+        if let Ok(img) = &image::load_from_memory(img.as_ref()) {
+            return Some(HasherConfig::new()
+                .to_hasher()
+                .hash_image(img));
+        }
+    }
+    None
+}
+
+async fn set_allowed(context: &Context, msg: &Message, url_regex: &Regex) {
+    let mut data = context.data.write().await;
+    if url_regex.is_match(&*msg.content) {
+        let allowed_links: &mut HashSet<String> = data.get_mut::<AllowedLinks>().unwrap();
+        let url_matches: HashSet<&str> = url_regex.find_iter(&msg.content)
+            .map(|mat| mat.as_str())
+            .collect();
+        for url in url_matches {
+            if let Ok(url) = url.parse() {
+                allowed_links.insert(url);
+            }
+        }
+    }
+    let allowed_hashes: &mut HashSet<ImageHash> = data.get_mut::<AllowedHashes>().unwrap();
+    for attachment in &msg.attachments {
+        if let Some(img_hash) = get_attachment_hash(attachment.clone()).await {
+            allowed_hashes.insert(img_hash);
+        }
+    }
+    let allowed_links: &mut HashSet<String> = data.get_mut::<AllowedLinks>().unwrap();
+    for embed in &msg.embeds {
+        if let Some(url) = embed.clone().url {
+            allowed_links.insert(url);
         }
     }
 }
