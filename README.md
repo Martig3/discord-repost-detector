@@ -13,5 +13,7 @@ REPOST_CACHE_LIMIT=5000
 
 Standard `cargo run`
 
+## Commands
+Use the `--allow` command with any link or image to exclude it from detection.
 
 
