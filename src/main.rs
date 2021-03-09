@@ -4,7 +4,6 @@ use std::env;
 use chrono::{DateTime, Utc};
 use image;
 use img_hash::{HasherConfig, ImageHash};
-use regex::Regex;
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
 use serenity::framework::standard::StandardFramework;
@@ -29,6 +28,11 @@ struct LinkMetadata {
     timestamp: DateTime<Utc>,
     user: User,
     msg_link: String,
+}
+
+struct HashMetadata {
+    hash: ImageHash,
+    source_type: String,
 }
 
 struct HashCache;
@@ -101,14 +105,13 @@ fn read_config() -> Config {
 impl EventHandler for Handler {
     async fn message(&self, context: Context, msg: Message) {
         if msg.author.bot { return; }
-        let url_regex = Regex::new("https?://(www\\.)?[-a-zA-Z0-9@:%._+~#=]{2,256}\\.[a-z]{2,4}\\b([-a-zA-Z0-9@:%_+.~#?&/=]*)").unwrap();
         if msg.content.contains("--allow") {
-            set_allowed(&context, &msg, &url_regex).await;
+            set_allowed(&context, &msg).await;
             return;
         }
         let mut data = context.data.write().await;
         let config: &Config = data.get::<Config>().unwrap();
-        if is_ignored_type(&msg, &config, &url_regex).await {
+        if is_ignored_type(&msg, &config).await {
             return;
         }
         let allowed_links: HashSet<String> = data.get::<AllowedLinks>().unwrap().clone();
@@ -121,12 +124,14 @@ impl EventHandler for Handler {
             .map(|e| e.unwrap())
             .filter(|str| !allowed_links.contains(str))
             .collect();
-        if attachments.is_empty() && embedded.is_empty() && !url_regex.is_match(&msg.content) {
+        if attachments.is_empty() && embedded.is_empty() {
             return;
         }
         let link_cache: &mut HashSet<LinkMetadata> = &mut data.get_mut::<LinkCache>().unwrap();
-        let url_matches: HashSet<&str> = url_regex.find_iter(&msg.content)
-            .map(|mat| mat.as_str())
+        let url_matches: HashSet<String> = msg.embeds.iter()
+            .map(|e| e.url.clone())
+            .filter(|e| e.is_some())
+            .map(|e| e.unwrap())
             .filter(|str| !allowed_links.contains(&*str.to_string()))
             .collect();
         for url in url_matches {
@@ -157,25 +162,27 @@ impl EventHandler for Handler {
                 link_cache.insert(LinkMetadata { url, timestamp, user, msg_link });
             }
         }
-        let mut hashes: Vec<ImageHash> = Vec::new();
+        let mut hashes: Vec<HashMetadata> = Vec::new();
         let allowed_hashes: HashSet<ImageHash> = data.get::<AllowedHashes>().unwrap().clone();
         for url in embedded {
             if let Some(image_hash) = get_embedded_hash(url).await {
                 if !allowed_hashes.contains(&image_hash) {
-                    hashes.push(image_hash);
+                    hashes.push(HashMetadata { hash: image_hash, source_type: String::from("embedded") });
                 }
             }
         }
         for attachment in attachments {
             if let Some(image_hash) = get_attachment_hash(attachment.clone()).await {
                 if !allowed_hashes.contains(&image_hash) {
-                    hashes.push(image_hash);
+                    hashes.push(HashMetadata { hash: image_hash, source_type: String::from("attachment") });
                 }
             }
         }
         let mut result: Option<&ImageMetadata>;
         let metadata_cache: &mut HashSet<ImageMetadata> = &mut data.get_mut::<HashCache>().unwrap();
-        for hash in hashes {
+        for meta_hash in hashes {
+            let hash = meta_hash.hash;
+            let source_type = meta_hash.source_type;
             result = metadata_cache.iter()
                 .find(|i| hash.dist(&i.hash) < 2);
             if result.is_none() {
@@ -184,6 +191,8 @@ impl EventHandler for Handler {
                 let timestamp = msg.timestamp;
                 metadata_cache.insert(ImageMetadata { hash, timestamp, user, msg_link });
             } else {
+                // dont send message if embedded, message already sent earlier if link
+                if source_type == "embedded" { return; }
                 let utc_now: DateTime<Utc> = Utc::now();
                 let days_between = utc_now.signed_duration_since(result.unwrap().timestamp).num_days();
                 let mut days_between_str = String::from(" posted this ");
@@ -231,12 +240,14 @@ async fn get_attachment_hash(attachment: Attachment) -> Option<ImageHash> {
     None
 }
 
-async fn set_allowed(context: &Context, msg: &Message, url_regex: &Regex) {
+async fn set_allowed(context: &Context, msg: &Message) {
     let mut data = context.data.write().await;
-    if url_regex.is_match(&*msg.content) {
+    if !msg.embeds.is_empty() {
         let allowed_links: &mut HashSet<String> = data.get_mut::<AllowedLinks>().unwrap();
-        let url_matches: HashSet<&str> = url_regex.find_iter(&msg.content)
-            .map(|mat| mat.as_str())
+        let url_matches: HashSet<String> = msg.embeds.iter()
+            .map(|e| e.url.clone())
+            .filter(|e| e.is_some())
+            .map(|e| e.unwrap())
             .collect();
         for url in url_matches {
             if let Ok(url) = url.parse() {
@@ -250,21 +261,12 @@ async fn set_allowed(context: &Context, msg: &Message, url_regex: &Regex) {
             allowed_hashes.insert(img_hash);
         }
     }
-    let allowed_links: &mut HashSet<String> = data.get_mut::<AllowedLinks>().unwrap();
-    for embed in &msg.embeds {
-        if let Some(url) = embed.clone().url {
-            allowed_links.insert(url);
-        }
-    }
 }
 
-async fn is_ignored_type(msg: &Message, config: &Config, url_regex: &Regex) -> bool {
-    let ignore_attached = config.ignored_type.contains(&String::from("attachment"));
-    let ignore_links = config.ignored_type.contains(&String::from("links"));
-    if url_regex.is_match(&msg.content) && ignore_links {
-        return true;
-    }
-    return if ignore_attached && !msg.attachments.is_empty() {
+async fn is_ignored_type(msg: &Message, config: &Config) -> bool {
+    let ignore_attached = config.ignored_types.contains(&String::from("attachment"));
+    let ignore_links = config.ignored_types.contains(&String::from("links"));
+    return if (ignore_attached && !msg.attachments.is_empty()) || (!msg.embeds.is_empty() && ignore_links){
         true
     } else {
         false
