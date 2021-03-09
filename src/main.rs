@@ -41,6 +41,7 @@ struct AllowedHashes;
 
 struct Config {
     cache_limit: u64,
+    ignored_types: Vec<String>,
 }
 
 impl TypeMapKey for HashCache {
@@ -90,7 +91,9 @@ async fn main() {
 
 fn read_config() -> Config {
     let cache_limit = env::var("REPOST_CACHE_LIMIT").expect("Expected a REPOST_CACHE_LIMIT env var").parse::<u64>().unwrap();
-    let config = Config { cache_limit };
+    let ignored_str = env::var("REPOST_IGNORED_TYPES").expect("Expected a REPOST_IGNORED_TYPES env var").parse::<String>().unwrap();
+    let ignored_types: Vec<String> = ignored_str.split(",").map(|str| String::from(str)).collect();
+    let config = Config { cache_limit, ignored_types };
     config
 }
 
@@ -104,6 +107,10 @@ impl EventHandler for Handler {
             return;
         }
         let mut data = context.data.write().await;
+        let config: &Config = data.get::<Config>().unwrap();
+        if is_ignored_type(&msg, &config, &url_regex).await {
+            return;
+        }
         let allowed_links: HashSet<String> = data.get::<AllowedLinks>().unwrap().clone();
         let attachments: Vec<&Attachment> = msg.attachments.iter()
             .map(|a| a)
@@ -249,4 +256,17 @@ async fn set_allowed(context: &Context, msg: &Message, url_regex: &Regex) {
             allowed_links.insert(url);
         }
     }
+}
+
+async fn is_ignored_type(msg: &Message, config: &Config, url_regex: &Regex) -> bool {
+    let ignore_attached = config.ignored_type.contains(&String::from("attachment"));
+    let ignore_links = config.ignored_type.contains(&String::from("links"));
+    if url_regex.is_match(&msg.content) && ignore_links {
+        return true;
+    }
+    return if ignore_attached && !msg.attachments.is_empty() {
+        true
+    } else {
+        false
+    };
 }
